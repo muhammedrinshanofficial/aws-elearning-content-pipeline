@@ -1,0 +1,335 @@
+# --- VPC ---
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name    = "${var.project_name}-vpc"
+    Project = var.project_name
+  }
+}
+
+# --- Public subnet (for ECS Fargate worker - needs internet to pull from ECR) ---
+resource "aws_subnet" "public" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block               = "10.0.1.0/24"
+  map_public_ip_on_launch  = true
+  availability_zone        = "${var.aws_region}a"
+
+  tags = {
+    Name    = "${var.project_name}-public-subnet"
+    Project = var.project_name
+  }
+}
+
+# --- Internet Gateway + routing, so the public subnet can reach the internet ---
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name    = "${var.project_name}-igw"
+    Project = var.project_name
+  }
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+
+  tags = {
+    Name    = "${var.project_name}-public-rt"
+    Project = var.project_name
+  }
+}
+
+resource "aws_route_table_association" "public" {
+  subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public.id
+}
+
+# --- Security group for the ECS preprocessing worker ---
+# Zero inbound rules: nothing can initiate a connection to it from
+# outside. Outbound-only, so it can pull its image from ECR and call
+# other AWS APIs, despite sitting in a public subnet.
+resource "aws_security_group" "ecs_worker" {
+  name        = "${var.project_name}-ecs-worker-sg"
+  description = "Zero inbound - outbound only, for the ECS preprocessing worker"
+  vpc_id      = aws_vpc.main.id
+
+  egress {
+    description = "Allow all outbound traffic"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name    = "${var.project_name}-ecs-worker-sg"
+    Project = var.project_name
+  }
+}
+
+# --- Free VPC Gateway Endpoints for S3 and DynamoDB ---
+# Avoids routing S3/DynamoDB traffic through a NAT Gateway (which
+# costs money) - gateway endpoints are free.
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id          = aws_vpc.main.id
+  service_name    = "com.amazonaws.${var.aws_region}.s3"
+  route_table_ids = [aws_route_table.public.id]
+
+  tags = {
+    Name    = "${var.project_name}-s3-endpoint"
+    Project = var.project_name
+  }
+}
+
+resource "aws_vpc_endpoint" "dynamodb" {
+  vpc_id          = aws_vpc.main.id
+  service_name    = "com.amazonaws.${var.aws_region}.dynamodb"
+  route_table_ids = [aws_route_table.public.id]
+
+  tags = {
+    Name    = "${var.project_name}-dynamodb-endpoint"
+    Project = var.project_name
+  }
+}
+
+# --- S3 bucket: raw instructor-uploaded video ---
+resource "aws_s3_bucket" "raw_video" {
+  bucket = "${var.project_name}-raw-video-${var.unique_suffix}"
+
+  tags = {
+    Name    = "${var.project_name}-raw-video"
+    Project = var.project_name
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "raw_video" {
+  bucket                  = aws_s3_bucket.raw_video.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "raw_video" {
+  bucket = aws_s3_bucket.raw_video.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+# --- S3 bucket: processed output (transcoded video, subtitles, PDF study guides) ---
+resource "aws_s3_bucket" "processed" {
+  bucket = "${var.project_name}-processed-${var.unique_suffix}"
+
+  tags = {
+    Name    = "${var.project_name}-processed"
+    Project = var.project_name
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "processed" {
+  bucket                  = aws_s3_bucket.processed.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "processed" {
+  bucket = aws_s3_bucket.processed.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+# --- S3 bucket: static frontend web app ---
+# NOT blocked from public access - this one needs to serve files
+# publicly via CloudFront later. Left plain for now; CloudFront +
+# Origin Access Control gets wired in a later step.
+resource "aws_s3_bucket" "frontend" {
+  bucket = "${var.project_name}-frontend-${var.unique_suffix}"
+
+  tags = {
+    Name    = "${var.project_name}-frontend"
+    Project = var.project_name
+  }
+}
+
+# --- DynamoDB table: course/video metadata ---
+resource "aws_dynamodb_table" "course_metadata" {
+  name         = "${var.project_name}-course-metadata"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "video_id"
+
+  attribute {
+    name = "video_id"
+    type = "S"
+  }
+
+  tags = {
+    Name    = "${var.project_name}-course-metadata"
+    Project = var.project_name
+  }
+}
+
+# --- ECS Task Execution Role ---
+# Used by ECS itself (not your app code) to pull the image from ECR
+# and write logs to CloudWatch. AWS provides a managed policy for
+# this exact purpose - no need to write it by hand.
+resource "aws_iam_role" "ecs_task_execution" {
+  name = "${var.project_name}-ecs-task-execution-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ecs-tasks.amazonaws.com" }
+    }]
+  })
+
+  tags = { Project = var.project_name }
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_task_execution" {
+  role       = aws_iam_role.ecs_task_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+# --- ECS Task Role ---
+# Used by YOUR CODE running inside the container (not ECS itself) -
+# whatever the preprocessing worker needs to actually do its job,
+# e.g. read/write S3. Intentionally empty of permissions for now -
+# will attach specific policies once the worker code is written and
+# we know exactly what it touches.
+resource "aws_iam_role" "ecs_task" {
+  name = "${var.project_name}-ecs-task-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ecs-tasks.amazonaws.com" }
+    }]
+  })
+
+  tags = { Project = var.project_name }
+}
+
+# --- Lambda Execution Role (base) ---
+# Shared starting point for pipeline Lambda functions (dispatcher,
+# PDF generator, notification handler, etc). Basic CloudWatch Logs
+# permission only for now - each function gets its specific
+# permissions (S3, DynamoDB, Step Functions StartExecution, etc.)
+# attached when that function is actually built.
+resource "aws_iam_role" "lambda_execution" {
+  name = "${var.project_name}-lambda-execution-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+
+  tags = { Project = var.project_name }
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
+  role       = aws_iam_role.lambda_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+# --- Step Functions Execution Role ---
+# Used by the state machine itself to invoke each pipeline stage
+# (Lambda, ECS RunTask, MediaConvert, Transcribe, Bedrock, etc).
+# Empty of permissions for now - built out stage by stage as the
+# state machine is defined in Step 7.
+resource "aws_iam_role" "step_functions_execution" {
+  name = "${var.project_name}-step-functions-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "states.amazonaws.com" }
+    }]
+  })
+
+  tags = { Project = var.project_name }
+}
+
+# --- ECR repository for the preprocessing worker image ---
+resource "aws_ecr_repository" "preprocessing_worker" {
+  name                 = "${var.project_name}-preprocessing-worker"
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  tags = { Project = var.project_name }
+}
+
+# --- ECS Cluster ---
+resource "aws_ecs_cluster" "main" {
+  name = "${var.project_name}-cluster"
+
+  tags = { Project = var.project_name }
+}
+
+# --- CloudWatch Log Group for the worker's container logs ---
+resource "aws_cloudwatch_log_group" "preprocessing_worker" {
+  name              = "/ecs/${var.project_name}-preprocessing-worker"
+  retention_in_days = 14
+
+  tags = { Project = var.project_name }
+}
+
+# --- ECS Task Definition ---
+# Not an aws_ecs_service - this task is launched on-demand per video
+# by Step Functions' RunTask integration (Step 7), not run as a
+# continuously-running service.
+resource "aws_ecs_task_definition" "preprocessing_worker" {
+  family                   = "${var.project_name}-preprocessing-worker"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "512"
+  memory                   = "1024"
+  execution_role_arn       = aws_iam_role.ecs_task_execution.arn
+  task_role_arn             = aws_iam_role.ecs_task.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "preprocessing-worker"
+      image     = "${aws_ecr_repository.preprocessing_worker.repository_url}:latest"
+      essential = true
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.preprocessing_worker.name
+          "awslogs-region"        = var.aws_region
+          "awslogs-stream-prefix" = "worker"
+        }
+      }
+    }
+  ])
+
+  tags = { Project = var.project_name }
+}
