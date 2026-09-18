@@ -333,3 +333,121 @@ resource "aws_ecs_task_definition" "preprocessing_worker" {
 
   tags = { Project = var.project_name }
 }
+
+# --- Step Functions: skeleton state machine (placeholder Pass states) ---
+# Real service integrations replace each Pass state one at a time,
+# starting with ECS RunTask.
+resource "aws_cloudwatch_log_group" "step_functions" {
+  name              = "/aws/vendedlogs/states/${var.project_name}-pipeline"
+  retention_in_days = 14
+
+  tags = { Project = var.project_name }
+}
+
+resource "aws_sfn_state_machine" "pipeline" {
+  name     = "${var.project_name}-pipeline"
+  role_arn = aws_iam_role.step_functions_execution.arn
+
+  definition = jsonencode({
+    Comment = "E-Learning pipeline - skeleton with placeholder Pass states"
+    StartAt = "PreprocessValidate"
+    States = {
+      PreprocessValidate = {
+  Type     = "Task"
+  Resource = "arn:aws:states:::ecs:runTask.sync"
+  Parameters = {
+    LaunchType     = "FARGATE"
+    Cluster        = aws_ecs_cluster.main.arn
+    TaskDefinition = aws_ecs_task_definition.preprocessing_worker.arn
+    NetworkConfiguration = {
+      AwsvpcConfiguration = {
+        Subnets        = [aws_subnet.public.id]
+        SecurityGroups = [aws_security_group.ecs_worker.id]
+        AssignPublicIp = "ENABLED"
+      }
+    }
+  }
+  Next = "Transcode"
+}
+      Transcode           = { Type = "Pass", Result = "ok", Next = "TranscribeAudio" }
+      TranscribeAudio     = { Type = "Pass", Result = "ok", Next = "TranslateText" }
+      TranslateText       = { Type = "Pass", Result = "ok", Next = "ModerateContent" }
+      ModerateContent     = { Type = "Pass", Result = "ok", Next = "ExtractTopics" }
+      ExtractTopics       = { Type = "Pass", Result = "ok", Next = "GenerateStudyNotes" }
+      GenerateStudyNotes  = { Type = "Pass", Result = "ok", Next = "RenderPdf" }
+      RenderPdf           = { Type = "Pass", Result = "ok", End = true }
+    }
+  })
+
+  logging_configuration {
+    log_destination        = "${aws_cloudwatch_log_group.step_functions.arn}:*"
+    include_execution_data = true
+    level                   = "ALL"
+  }
+
+  tags = { Project = var.project_name }
+}
+
+# Step Functions needs explicit permission to write execution logs —
+# there's no AWS-managed policy for this specific purpose, so it's inline.
+resource "aws_iam_role_policy" "step_functions_logging" {
+  name = "${var.project_name}-sfn-logging"
+  role = aws_iam_role.step_functions_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "logs:CreateLogDelivery",
+        "logs:GetLogDelivery",
+        "logs:UpdateLogDelivery",
+        "logs:DeleteLogDelivery",
+        "logs:ListLogDeliveries",
+        "logs:PutResourcePolicy",
+        "logs:DescribeResourcePolicies",
+        "logs:DescribeLogGroups"
+      ]
+      Resource = "*"
+    }]
+  })
+}
+
+# --- IAM: lets Step Functions actually launch and monitor the ECS task ---
+resource "aws_iam_role_policy" "step_functions_ecs" {
+  name = "${var.project_name}-sfn-ecs-runtask"
+  role = aws_iam_role.step_functions_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["ecs:RunTask", "ecs:StopTask", "ecs:DescribeTasks"]
+        Resource = "*"
+      },
+      {
+        # Step Functions has to be allowed to hand these two roles to ECS -
+        # without this, RunTask fails even though the roles themselves exist.
+        Effect   = "Allow"
+        Action   = "iam:PassRole"
+        Resource = [
+          aws_iam_role.ecs_task.arn,
+          aws_iam_role.ecs_task_execution.arn
+        ]
+      },
+      {
+        # The .sync integration manages an EventBridge rule behind the
+        # scenes to detect when the ECS task stops - this is what lets
+        # Step Functions "wait" for it instead of just firing and forgetting.
+        Effect = "Allow"
+        Action = [
+          "events:PutTargets",
+          "events:PutRule",
+          "events:DescribeRule"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}

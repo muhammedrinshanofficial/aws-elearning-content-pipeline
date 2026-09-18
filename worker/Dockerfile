@@ -1,2 +1,2 @@
-FROM public.ecr.aws/lambda/python:3.12
+FROM public.ecr.aws/docker/library/alpine:3.20
 CMD ["echo", "preprocessing worker placeholder - real validation logic comes later"]
