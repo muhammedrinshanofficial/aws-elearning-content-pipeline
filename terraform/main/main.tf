@@ -367,9 +367,22 @@ resource "aws_sfn_state_machine" "pipeline" {
       }
     }
   }
+        ResultPath = "$.ecsResult"
   Next = "Transcode"
 }
-      Transcode           = { Type = "Pass", Result = "ok", Next = "TranscribeAudio" }
+          Transcode = {
+      Type     = "Task"
+      Resource = "arn:aws:states:::lambda:invoke.waitForTaskToken"
+      Parameters = {
+        FunctionName = aws_lambda_function.submit_mediaconvert_job.arn
+        Payload = {
+          "TaskToken.$" = "$$.Task.Token"
+          "input_key.$" = "$.input_key"
+        }
+      }
+      ResultPath = "$.transcodeResult"
+      Next = "TranscribeAudio"
+    }
       TranscribeAudio     = { Type = "Pass", Result = "ok", Next = "TranslateText" }
       TranslateText       = { Type = "Pass", Result = "ok", Next = "ModerateContent" }
       ModerateContent     = { Type = "Pass", Result = "ok", Next = "ExtractTopics" }
@@ -449,5 +462,204 @@ resource "aws_iam_role_policy" "step_functions_ecs" {
         Resource = "*"
       }
     ]
+  })
+}
+
+# --- MediaConvert IAM Role ---
+# This role is used by MediaConvert itself (not your app code) to read
+# the raw video and write the transcoded output. MediaConvert needs its
+# own role because it's AWS acting on your behalf, not Step Functions
+# or Lambda calling it directly.
+resource "aws_iam_role" "mediaconvert" {
+  name = "${var.project_name}-mediaconvert-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "mediaconvert.amazonaws.com" }
+    }]
+  })
+
+  tags = { Project = var.project_name }
+}
+
+# --- MediaConvert permissions ---
+# Read from raw_video (the input video), write to processed (the
+# transcoded output). Scoped to just these two buckets - not full S3
+# access - same least-privilege approach as every other role so far.
+resource "aws_iam_role_policy" "mediaconvert_s3" {
+  name = "${var.project_name}-mediaconvert-s3"
+  role = aws_iam_role.mediaconvert.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "${aws_s3_bucket.raw_video.arn}/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:PutObject"]
+        Resource = "${aws_s3_bucket.processed.arn}/*"
+      }
+    ]
+  })
+}
+
+# --- Lambda: submits the MediaConvert job ---
+# Invoked by Step Functions with .waitForTaskToken. Creates the
+# MediaConvert job, stashes the task token in the job's metadata, then
+# returns - Step Functions stays paused until the completion Lambda
+# calls SendTaskSuccess/Failure separately.
+resource "aws_lambda_function" "submit_mediaconvert_job" {
+  function_name = "${var.project_name}-submit-mediaconvert-job"
+  role          = aws_iam_role.lambda_execution.arn
+  handler       = "index.handler"
+  runtime       = "python3.12"
+  timeout       = 30
+  filename      = "${path.module}/../../lambdas/submit_mediaconvert_job.zip"
+  source_code_hash = filebase64sha256("${path.module}/../../lambdas/submit_mediaconvert_job.zip")
+
+  environment {
+    variables = {
+      MEDIACONVERT_ROLE_ARN = aws_iam_role.mediaconvert.arn
+      INPUT_BUCKET          = aws_s3_bucket.raw_video.bucket
+      OUTPUT_BUCKET         = aws_s3_bucket.processed.bucket
+            TOKEN_TABLE            = aws_dynamodb_table.mediaconvert_tokens.name
+    }
+  }
+}
+
+# --- Lambda: handles MediaConvert job completion ---
+# Triggered by the EventBridge rule (Piece 3) whenever a MediaConvert
+# job finishes. Pulls the task token back out of the event and wakes
+# the paused Step Functions execution back up.
+resource "aws_lambda_function" "handle_mediaconvert_completion" {
+  function_name = "${var.project_name}-handle-mediaconvert-completion"
+  role          = aws_iam_role.lambda_execution.arn
+  handler       = "index.handler"
+  runtime       = "python3.12"
+  timeout       = 10
+  filename      = "${path.module}/../../lambdas/handle_mediaconvert_completion.zip"
+  source_code_hash = filebase64sha256("${path.module}/../../lambdas/handle_mediaconvert_completion.zip")
+
+   environment {
+    variables = {
+      TOKEN_TABLE = aws_dynamodb_table.mediaconvert_tokens.name
+    }
+  } 
+}
+
+# --- Extra permissions for lambda_execution role ---
+# Extending the existing role from Step 5 rather than making new ones
+# - both new Lambdas can share it - they just need MediaConvert
+# access, permission to hand off the mediaconvert_role, and permission
+# to signal Step Functions back.
+resource "aws_iam_role_policy" "lambda_mediaconvert" {
+  name = "${var.project_name}-lambda-mediaconvert"
+  role = aws_iam_role.lambda_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["mediaconvert:CreateJob", "mediaconvert:DescribeEndpoints"]
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = "iam:PassRole"
+        Resource = aws_iam_role.mediaconvert.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["states:SendTaskSuccess", "states:SendTaskFailure"]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+# --- EventBridge rule: watches for MediaConvert job completion ---
+# AWS automatically emits an event whenever a MediaConvert job changes
+# state. This rule catches COMPLETE and ERROR specifically, and routes
+# them to the completion Lambda.
+resource "aws_cloudwatch_event_rule" "mediaconvert_state_change" {
+  name = "${var.project_name}-mediaconvert-state-change"
+
+  event_pattern = jsonencode({
+    source      = ["aws.mediaconvert"]
+    detail-type = ["MediaConvert Job State Change"]
+    detail      = { status = ["COMPLETE", "ERROR"] }
+  })
+}
+
+# --- Wire the rule to the completion Lambda ---
+resource "aws_cloudwatch_event_target" "mediaconvert_completion_lambda" {
+  rule = aws_cloudwatch_event_rule.mediaconvert_state_change.name
+  arn  = aws_lambda_function.handle_mediaconvert_completion.arn
+}
+
+# --- Let EventBridge actually invoke the Lambda ---
+# Without this, the rule can fire but EventBridge isn't authorized to
+# actually call the Lambda when it does.
+resource "aws_lambda_permission" "eventbridge_invoke_completion" {
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.handle_mediaconvert_completion.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.mediaconvert_state_change.arn
+}
+
+# --- Let Step Functions invoke the MediaConvert submit Lambda ---
+resource "aws_iam_role_policy" "step_functions_lambda" {
+  name = "${var.project_name}-sfn-lambda-invoke"
+  role = aws_iam_role.step_functions_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "lambda:InvokeFunction"
+      Resource = aws_lambda_function.submit_mediaconvert_job.arn
+    }]
+  })
+}
+
+# --- DynamoDB table: maps MediaConvert job IDs to Step Functions task tokens ---
+# Task tokens are often longer than MediaConvert's 256-character
+# UserMetadata limit, so the token can't be stashed directly on the
+# job. It's stored here instead, keyed by job ID, and looked back up
+# when the completion Lambda fires.
+resource "aws_dynamodb_table" "mediaconvert_tokens" {
+  name         = "${var.project_name}-mediaconvert-tokens"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "job_id"
+
+  attribute {
+    name = "job_id"
+    type = "S"
+  }
+
+  tags = { Project = var.project_name }
+}
+
+# --- Let the Lambdas read/write the token table ---
+resource "aws_iam_role_policy" "lambda_token_table" {
+  name = "${var.project_name}-lambda-token-table"
+  role = aws_iam_role.lambda_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:DeleteItem"]
+      Resource = aws_dynamodb_table.mediaconvert_tokens.arn
+    }]
   })
 }
