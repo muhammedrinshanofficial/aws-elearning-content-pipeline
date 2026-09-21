@@ -383,7 +383,7 @@ resource "aws_sfn_state_machine" "pipeline" {
       ResultPath = "$.transcodeResult"
       Next = "TranscribeAudio"
     }
-                  TranscribeAudio = {
+                                    TranscribeAudio = {
         Type     = "Task"
         Resource = "arn:aws:states:::lambda:invoke.waitForTaskToken"
         Parameters = {
@@ -395,11 +395,8 @@ resource "aws_sfn_state_machine" "pipeline" {
           }
         }
         ResultPath = "$.transcribeResult"
-        Next = "TranslateText"
+        Next = "GenerateStudyNotes"
       }
-      TranslateText       = { Type = "Pass", Result = "ok", Next = "ModerateContent" }
-      ModerateContent     = { Type = "Pass", Result = "ok", Next = "ExtractTopics" }
-      ExtractTopics       = { Type = "Pass", Result = "ok", Next = "GenerateStudyNotes" }
       GenerateStudyNotes  = { Type = "Pass", Result = "ok", Next = "RenderPdf" }
       RenderPdf           = { Type = "Pass", Result = "ok", End = true }
     }
