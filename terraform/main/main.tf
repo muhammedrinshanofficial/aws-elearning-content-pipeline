@@ -383,7 +383,20 @@ resource "aws_sfn_state_machine" "pipeline" {
       ResultPath = "$.transcodeResult"
       Next = "TranscribeAudio"
     }
-      TranscribeAudio     = { Type = "Pass", Result = "ok", Next = "TranslateText" }
+                  TranscribeAudio = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::lambda:invoke.waitForTaskToken"
+        Parameters = {
+          FunctionName = aws_lambda_function.submit_transcribe_job.arn
+          Payload = {
+            "TaskToken.$"     = "$$.Task.Token"
+            "input_key.$"     = "$.input_key"
+            "language_code.$" = "$.language_code"
+          }
+        }
+        ResultPath = "$.transcribeResult"
+        Next = "TranslateText"
+      }
       TranslateText       = { Type = "Pass", Result = "ok", Next = "ModerateContent" }
       ModerateContent     = { Type = "Pass", Result = "ok", Next = "ExtractTopics" }
       ExtractTopics       = { Type = "Pass", Result = "ok", Next = "GenerateStudyNotes" }
@@ -660,6 +673,160 @@ resource "aws_iam_role_policy" "lambda_token_table" {
       Effect   = "Allow"
       Action   = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:DeleteItem"]
       Resource = aws_dynamodb_table.mediaconvert_tokens.arn
+    }]
+  })
+}
+
+# --- Extra permissions for lambda_execution role: Transcribe ---
+# Transcribe has no separate service role like MediaConvert does - it
+# just uses the permissions of whichever caller (this Lambda's role)
+# invokes StartTranscriptionJob. So this grants read on raw_video
+# (input) and write on processed (transcript output), plus the
+# Transcribe API actions themselves.
+resource "aws_iam_role_policy" "lambda_transcribe" {
+  name = "${var.project_name}-lambda-transcribe"
+  role = aws_iam_role.lambda_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["transcribe:StartTranscriptionJob", "transcribe:GetTranscriptionJob"]
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "${aws_s3_bucket.raw_video.arn}/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:PutObject"]
+        Resource = "${aws_s3_bucket.processed.arn}/*"
+      }
+    ]
+  })
+}
+
+# --- DynamoDB table: maps Transcribe job names to Step Functions task tokens ---
+# Same handoff pattern as mediaconvert_tokens - Transcribe job names are
+# far shorter than a Step Functions task token, so the token can't be
+# attached to the job directly. Stored here instead, keyed by job name,
+# looked up when the completion Lambda fires.
+resource "aws_dynamodb_table" "transcribe_tokens" {
+  name         = "${var.project_name}-transcribe-tokens"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "job_name"
+
+  attribute {
+    name = "job_name"
+    type = "S"
+  }
+
+  tags = { Project = var.project_name }
+}
+
+# --- Let the Lambdas read/write the Transcribe token table ---
+resource "aws_iam_role_policy" "lambda_transcribe_token_table" {
+  name = "${var.project_name}-lambda-transcribe-token-table"
+  role = aws_iam_role.lambda_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:DeleteItem"]
+      Resource = aws_dynamodb_table.transcribe_tokens.arn
+    }]
+  })
+}
+
+# --- Lambda: submits the Transcribe job ---
+# Invoked by Step Functions with .waitForTaskToken. Starts the
+# transcription job (with multi-language identification enabled),
+# stashes the task token in DynamoDB keyed by job name, then returns -
+# Step Functions stays paused until the completion Lambda fires.
+resource "aws_lambda_function" "submit_transcribe_job" {
+  function_name = "${var.project_name}-submit-transcribe-job"
+  role          = aws_iam_role.lambda_execution.arn
+  handler       = "index.handler"
+  runtime       = "python3.12"
+  timeout       = 30
+  filename      = "${path.module}/../../lambdas/submit_transcribe_job.zip"
+  source_code_hash = filebase64sha256("${path.module}/../../lambdas/submit_transcribe_job.zip")
+
+  environment {
+    variables = {
+      INPUT_BUCKET  = aws_s3_bucket.raw_video.bucket
+      OUTPUT_BUCKET = aws_s3_bucket.processed.bucket
+      TOKEN_TABLE   = aws_dynamodb_table.transcribe_tokens.name
+    }
+  }
+}
+
+# --- Lambda: handles Transcribe job completion ---
+# Triggered by an EventBridge rule (added in Piece 4) whenever a
+# Transcribe job finishes. Pulls the task token back out of DynamoDB
+# using the job name and wakes the paused Step Functions execution.
+resource "aws_lambda_function" "handle_transcribe_completion" {
+  function_name = "${var.project_name}-handle-transcribe-completion"
+  role          = aws_iam_role.lambda_execution.arn
+  handler       = "index.handler"
+  runtime       = "python3.12"
+  timeout       = 10
+  filename      = "${path.module}/../../lambdas/handle_transcribe_completion.zip"
+  source_code_hash = filebase64sha256("${path.module}/../../lambdas/handle_transcribe_completion.zip")
+
+  environment {
+    variables = {
+      TOKEN_TABLE = aws_dynamodb_table.transcribe_tokens.name
+    }
+  }
+}
+
+# --- EventBridge rule: watches for Transcribe job completion ---
+# AWS automatically emits an event whenever a Transcribe job changes
+# state. This rule catches COMPLETED and FAILED specifically, and
+# routes them to the completion Lambda.
+resource "aws_cloudwatch_event_rule" "transcribe_state_change" {
+  name = "${var.project_name}-transcribe-state-change"
+
+  event_pattern = jsonencode({
+    source      = ["aws.transcribe"]
+    detail-type = ["Transcribe Job State Change"]
+    detail      = { TranscriptionJobStatus = ["COMPLETED", "FAILED"] }
+  })
+}
+
+# --- Wire the rule to the completion Lambda ---
+resource "aws_cloudwatch_event_target" "transcribe_completion_lambda" {
+  rule = aws_cloudwatch_event_rule.transcribe_state_change.name
+  arn  = aws_lambda_function.handle_transcribe_completion.arn
+}
+
+# --- Let EventBridge actually invoke the Lambda ---
+# Without this, the rule can fire but EventBridge isn't authorized to
+# actually call the Lambda when it does.
+resource "aws_lambda_permission" "eventbridge_invoke_transcribe_completion" {
+  statement_id  = "AllowEventBridgeInvokeTranscribe"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.handle_transcribe_completion.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.transcribe_state_change.arn
+}
+
+# --- Let Step Functions invoke the Transcribe submit Lambda ---
+resource "aws_iam_role_policy" "step_functions_lambda_transcribe" {
+  name = "${var.project_name}-sfn-lambda-invoke-transcribe"
+  role = aws_iam_role.step_functions_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "lambda:InvokeFunction"
+      Resource = aws_lambda_function.submit_transcribe_job.arn
     }]
   })
 }
