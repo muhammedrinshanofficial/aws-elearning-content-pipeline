@@ -397,7 +397,16 @@ resource "aws_sfn_state_machine" "pipeline" {
         ResultPath = "$.transcribeResult"
         Next = "GenerateStudyNotes"
       }
-      GenerateStudyNotes  = { Type = "Pass", Result = "ok", Next = "RenderPdf" }
+            GenerateStudyNotes = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::lambda:invoke"
+        Parameters = {
+          FunctionName = aws_lambda_function.generate_study_notes.arn
+          "Payload.$"  = "$"
+        }
+        ResultPath = "$.studyNotesResult"
+        Next = "RenderPdf"
+      }
       RenderPdf           = { Type = "Pass", Result = "ok", End = true }
     }
   })
@@ -824,6 +833,69 @@ resource "aws_iam_role_policy" "step_functions_lambda_transcribe" {
       Effect   = "Allow"
       Action   = "lambda:InvokeFunction"
       Resource = aws_lambda_function.submit_transcribe_job.arn
+    }]
+  })
+}
+
+# --- Extra permissions for lambda_execution role: Bedrock ---
+# Lets the study-notes Lambda call Claude via Bedrock's Converse API.
+# Note: bedrock:InvokeModel is the correct/only permission needed here -
+# there's no separate "bedrock:Converse" IAM action; AWS authorizes the
+# Converse API through InvokeModel even though the operation name differs.
+resource "aws_iam_role_policy" "lambda_bedrock" {
+  name = "${var.project_name}-lambda-bedrock"
+  role = aws_iam_role.lambda_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["bedrock:InvokeModel"]
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "${aws_s3_bucket.processed.arn}/*"
+      }
+    ]
+  })
+}
+
+# --- Lambda: generates study notes via Bedrock ---
+# Called directly by Step Functions (plain Task, not waitForTaskToken) -
+# Bedrock's Converse API is synchronous, so no wait-and-callback pattern
+# is needed here, unlike MediaConvert/Transcribe. Fetches the transcript
+# from processed/transcripts/, sends it to Claude, returns the notes text.
+resource "aws_lambda_function" "generate_study_notes" {
+  function_name = "${var.project_name}-generate-study-notes"
+  role          = aws_iam_role.lambda_execution.arn
+  handler       = "index.handler"
+  runtime       = "python3.12"
+  timeout       = 60
+  filename      = "${path.module}/../../lambdas/generate_study_notes.zip"
+  source_code_hash = filebase64sha256("${path.module}/../../lambdas/generate_study_notes.zip")
+
+  environment {
+    variables = {
+      MODEL_ID          = "us.anthropic.claude-sonnet-4-6"
+      PROCESSED_BUCKET  = aws_s3_bucket.processed.bucket
+    }
+  }
+}
+
+# --- Let Step Functions invoke the study-notes Lambda ---
+resource "aws_iam_role_policy" "step_functions_lambda_bedrock" {
+  name = "${var.project_name}-sfn-lambda-invoke-bedrock"
+  role = aws_iam_role.step_functions_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "lambda:InvokeFunction"
+      Resource = aws_lambda_function.generate_study_notes.arn
     }]
   })
 }
