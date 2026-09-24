@@ -397,17 +397,29 @@ resource "aws_sfn_state_machine" "pipeline" {
         ResultPath = "$.transcribeResult"
         Next = "GenerateStudyNotes"
       }
-            GenerateStudyNotes = {
+                  GenerateStudyNotes = {
         Type     = "Task"
         Resource = "arn:aws:states:::lambda:invoke"
         Parameters = {
           FunctionName = aws_lambda_function.generate_study_notes.arn
           "Payload.$"  = "$"
         }
+        ResultSelector = {
+          "notes.$" = "$.Payload.notes"
+        }
         ResultPath = "$.studyNotesResult"
         Next = "RenderPdf"
       }
-      RenderPdf           = { Type = "Pass", Result = "ok", End = true }
+            RenderPdf = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::lambda:invoke"
+        Parameters = {
+          FunctionName = aws_lambda_function.render_pdf.arn
+          "Payload.$"  = "$"
+        }
+        ResultPath = "$.renderPdfResult"
+        End        = true
+      }
     }
   })
 
@@ -896,6 +908,42 @@ resource "aws_iam_role_policy" "step_functions_lambda_bedrock" {
       Effect   = "Allow"
       Action   = "lambda:InvokeFunction"
       Resource = aws_lambda_function.generate_study_notes.arn
+    }]
+  })
+}
+
+# --- Lambda: renders study notes into a PDF and uploads it ---
+# Called directly by Step Functions (plain Task, same as GenerateStudyNotes) -
+# parses the Markdown-structured notes text, builds a PDF with fpdf2, and
+# uploads it to processed/study-notes/. This is the final stage of the
+# pipeline.
+resource "aws_lambda_function" "render_pdf" {
+  function_name = "${var.project_name}-render-pdf"
+  role          = aws_iam_role.lambda_execution.arn
+  handler       = "index.handler"
+  runtime       = "python3.12"
+  timeout       = 30
+  filename      = "${path.module}/../../lambdas/render_pdf.zip"
+  source_code_hash = filebase64sha256("${path.module}/../../lambdas/render_pdf.zip")
+
+  environment {
+    variables = {
+      PROCESSED_BUCKET = aws_s3_bucket.processed.bucket
+    }
+  }
+}
+
+# --- Let Step Functions invoke the render_pdf Lambda ---
+resource "aws_iam_role_policy" "step_functions_lambda_pdf" {
+  name = "${var.project_name}-sfn-lambda-invoke-pdf"
+  role = aws_iam_role.step_functions_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "lambda:InvokeFunction"
+      Resource = aws_lambda_function.render_pdf.arn
     }]
   })
 }
