@@ -127,7 +127,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "raw_video" {
   }
 }
 
-# --- S3 bucket: processed output (transcoded video, subtitles, PDF study guides) ---
+# --- S3 bucket: processed output (transcript JSON, PDF study notes) ---
 resource "aws_s3_bucket" "processed" {
   bucket = "${var.project_name}-processed-${var.unique_suffix}"
 
@@ -257,9 +257,7 @@ resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
 
 # --- Step Functions Execution Role ---
 # Used by the state machine itself to invoke each pipeline stage
-# (Lambda, ECS RunTask, MediaConvert, Transcribe, Bedrock, etc).
-# Empty of permissions for now - built out stage by stage as the
-# state machine is defined in Step 7.
+# (ECS RunTask, Transcribe Lambda, Bedrock Lambda, PDF Lambda).
 resource "aws_iam_role" "step_functions_execution" {
   name = "${var.project_name}-step-functions-role"
 
@@ -304,7 +302,7 @@ resource "aws_cloudwatch_log_group" "preprocessing_worker" {
 
 # --- ECS Task Definition ---
 # Not an aws_ecs_service - this task is launched on-demand per video
-# by Step Functions' RunTask integration (Step 7), not run as a
+# by Step Functions' RunTask integration, not run as a
 # continuously-running service.
 resource "aws_ecs_task_definition" "preprocessing_worker" {
   family                   = "${var.project_name}-preprocessing-worker"
@@ -334,9 +332,9 @@ resource "aws_ecs_task_definition" "preprocessing_worker" {
   tags = { Project = var.project_name }
 }
 
-# --- Step Functions: skeleton state machine (placeholder Pass states) ---
-# Real service integrations replace each Pass state one at a time,
-# starting with ECS RunTask.
+# --- Step Functions: the pipeline itself ---
+# Preprocess/validate (ECS) -> Transcribe -> generate study notes
+# (Bedrock) -> render PDF. Each stage below is a real AWS integration.
 resource "aws_cloudwatch_log_group" "step_functions" {
   name              = "/aws/vendedlogs/states/${var.project_name}-pipeline"
   retention_in_days = 14
@@ -349,41 +347,28 @@ resource "aws_sfn_state_machine" "pipeline" {
   role_arn = aws_iam_role.step_functions_execution.arn
 
   definition = jsonencode({
-    Comment = "E-Learning pipeline - skeleton with placeholder Pass states"
+    Comment = "E-Learning pipeline: preprocess (ECS) -> transcribe -> generate study notes (Bedrock) -> render PDF"
     StartAt = "PreprocessValidate"
     States = {
       PreprocessValidate = {
-  Type     = "Task"
-  Resource = "arn:aws:states:::ecs:runTask.sync"
-  Parameters = {
-    LaunchType     = "FARGATE"
-    Cluster        = aws_ecs_cluster.main.arn
-    TaskDefinition = aws_ecs_task_definition.preprocessing_worker.arn
-    NetworkConfiguration = {
-      AwsvpcConfiguration = {
-        Subnets        = [aws_subnet.public.id]
-        SecurityGroups = [aws_security_group.ecs_worker.id]
-        AssignPublicIp = "ENABLED"
-      }
-    }
-  }
-        ResultPath = "$.ecsResult"
-  Next = "Transcode"
-}
-          Transcode = {
-      Type     = "Task"
-      Resource = "arn:aws:states:::lambda:invoke.waitForTaskToken"
-      Parameters = {
-        FunctionName = aws_lambda_function.submit_mediaconvert_job.arn
-        Payload = {
-          "TaskToken.$" = "$$.Task.Token"
-          "input_key.$" = "$.input_key"
+        Type     = "Task"
+        Resource = "arn:aws:states:::ecs:runTask.sync"
+        Parameters = {
+          LaunchType     = "FARGATE"
+          Cluster        = aws_ecs_cluster.main.arn
+          TaskDefinition = aws_ecs_task_definition.preprocessing_worker.arn
+          NetworkConfiguration = {
+            AwsvpcConfiguration = {
+              Subnets        = [aws_subnet.public.id]
+              SecurityGroups = [aws_security_group.ecs_worker.id]
+              AssignPublicIp = "ENABLED"
+            }
+          }
         }
+        ResultPath = "$.ecsResult"
+        Next       = "TranscribeAudio"
       }
-      ResultPath = "$.transcodeResult"
-      Next = "TranscribeAudio"
-    }
-                                    TranscribeAudio = {
+      TranscribeAudio = {
         Type     = "Task"
         Resource = "arn:aws:states:::lambda:invoke.waitForTaskToken"
         Parameters = {
@@ -394,6 +379,7 @@ resource "aws_sfn_state_machine" "pipeline" {
             "language_code.$" = "$.language_code"
           }
         }
+                TimeoutSeconds = 3600
         ResultPath = "$.transcribeResult"
         Next = "GenerateStudyNotes"
       }
@@ -496,207 +482,26 @@ resource "aws_iam_role_policy" "step_functions_ecs" {
   })
 }
 
-# --- MediaConvert IAM Role ---
-# This role is used by MediaConvert itself (not your app code) to read
-# the raw video and write the transcoded output. MediaConvert needs its
-# own role because it's AWS acting on your behalf, not Step Functions
-# or Lambda calling it directly.
-resource "aws_iam_role" "mediaconvert" {
-  name = "${var.project_name}-mediaconvert-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action    = "sts:AssumeRole"
-      Effect    = "Allow"
-      Principal = { Service = "mediaconvert.amazonaws.com" }
-    }]
-  })
-
-  tags = { Project = var.project_name }
-}
-
-# --- MediaConvert permissions ---
-# Read from raw_video (the input video), write to processed (the
-# transcoded output). Scoped to just these two buckets - not full S3
-# access - same least-privilege approach as every other role so far.
-resource "aws_iam_role_policy" "mediaconvert_s3" {
-  name = "${var.project_name}-mediaconvert-s3"
-  role = aws_iam_role.mediaconvert.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect   = "Allow"
-        Action   = ["s3:GetObject"]
-        Resource = "${aws_s3_bucket.raw_video.arn}/*"
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["s3:PutObject"]
-        Resource = "${aws_s3_bucket.processed.arn}/*"
-      }
-    ]
-  })
-}
-
-# --- Lambda: submits the MediaConvert job ---
-# Invoked by Step Functions with .waitForTaskToken. Creates the
-# MediaConvert job, stashes the task token in the job's metadata, then
-# returns - Step Functions stays paused until the completion Lambda
-# calls SendTaskSuccess/Failure separately.
-resource "aws_lambda_function" "submit_mediaconvert_job" {
-  function_name = "${var.project_name}-submit-mediaconvert-job"
-  role          = aws_iam_role.lambda_execution.arn
-  handler       = "index.handler"
-  runtime       = "python3.12"
-  timeout       = 30
-  filename      = "${path.module}/../../lambdas/submit_mediaconvert_job.zip"
-  source_code_hash = filebase64sha256("${path.module}/../../lambdas/submit_mediaconvert_job.zip")
-
-  environment {
-    variables = {
-      MEDIACONVERT_ROLE_ARN = aws_iam_role.mediaconvert.arn
-      INPUT_BUCKET          = aws_s3_bucket.raw_video.bucket
-      OUTPUT_BUCKET         = aws_s3_bucket.processed.bucket
-            TOKEN_TABLE            = aws_dynamodb_table.mediaconvert_tokens.name
-    }
-  }
-}
-
-# --- Lambda: handles MediaConvert job completion ---
-# Triggered by the EventBridge rule (Piece 3) whenever a MediaConvert
-# job finishes. Pulls the task token back out of the event and wakes
-# the paused Step Functions execution back up.
-resource "aws_lambda_function" "handle_mediaconvert_completion" {
-  function_name = "${var.project_name}-handle-mediaconvert-completion"
-  role          = aws_iam_role.lambda_execution.arn
-  handler       = "index.handler"
-  runtime       = "python3.12"
-  timeout       = 10
-  filename      = "${path.module}/../../lambdas/handle_mediaconvert_completion.zip"
-  source_code_hash = filebase64sha256("${path.module}/../../lambdas/handle_mediaconvert_completion.zip")
-
-   environment {
-    variables = {
-      TOKEN_TABLE = aws_dynamodb_table.mediaconvert_tokens.name
-    }
-  } 
-}
-
-# --- Extra permissions for lambda_execution role ---
-# Extending the existing role from Step 5 rather than making new ones
-# - both new Lambdas can share it - they just need MediaConvert
-# access, permission to hand off the mediaconvert_role, and permission
-# to signal Step Functions back.
-resource "aws_iam_role_policy" "lambda_mediaconvert" {
-  name = "${var.project_name}-lambda-mediaconvert"
-  role = aws_iam_role.lambda_execution.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect   = "Allow"
-        Action   = ["mediaconvert:CreateJob", "mediaconvert:DescribeEndpoints"]
-        Resource = "*"
-      },
-      {
-        Effect   = "Allow"
-        Action   = "iam:PassRole"
-        Resource = aws_iam_role.mediaconvert.arn
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["states:SendTaskSuccess", "states:SendTaskFailure"]
-        Resource = "*"
-      }
-    ]
-  })
-}
-
-# --- EventBridge rule: watches for MediaConvert job completion ---
-# AWS automatically emits an event whenever a MediaConvert job changes
-# state. This rule catches COMPLETE and ERROR specifically, and routes
-# them to the completion Lambda.
-resource "aws_cloudwatch_event_rule" "mediaconvert_state_change" {
-  name = "${var.project_name}-mediaconvert-state-change"
-
-  event_pattern = jsonencode({
-    source      = ["aws.mediaconvert"]
-    detail-type = ["MediaConvert Job State Change"]
-    detail      = { status = ["COMPLETE", "ERROR"] }
-  })
-}
-
-# --- Wire the rule to the completion Lambda ---
-resource "aws_cloudwatch_event_target" "mediaconvert_completion_lambda" {
-  rule = aws_cloudwatch_event_rule.mediaconvert_state_change.name
-  arn  = aws_lambda_function.handle_mediaconvert_completion.arn
-}
-
-# --- Let EventBridge actually invoke the Lambda ---
-# Without this, the rule can fire but EventBridge isn't authorized to
-# actually call the Lambda when it does.
-resource "aws_lambda_permission" "eventbridge_invoke_completion" {
-  statement_id  = "AllowEventBridgeInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.handle_mediaconvert_completion.function_name
-  principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.mediaconvert_state_change.arn
-}
-
-# --- Let Step Functions invoke the MediaConvert submit Lambda ---
-resource "aws_iam_role_policy" "step_functions_lambda" {
-  name = "${var.project_name}-sfn-lambda-invoke"
-  role = aws_iam_role.step_functions_execution.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = "lambda:InvokeFunction"
-      Resource = aws_lambda_function.submit_mediaconvert_job.arn
-    }]
-  })
-}
-
-# --- DynamoDB table: maps MediaConvert job IDs to Step Functions task tokens ---
-# Task tokens are often longer than MediaConvert's 256-character
-# UserMetadata limit, so the token can't be stashed directly on the
-# job. It's stored here instead, keyed by job ID, and looked back up
-# when the completion Lambda fires.
-resource "aws_dynamodb_table" "mediaconvert_tokens" {
-  name         = "${var.project_name}-mediaconvert-tokens"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "job_id"
-
-  attribute {
-    name = "job_id"
-    type = "S"
-  }
-
-  tags = { Project = var.project_name }
-}
-
-# --- Let the Lambdas read/write the token table ---
-resource "aws_iam_role_policy" "lambda_token_table" {
-  name = "${var.project_name}-lambda-token-table"
+# --- Lets any Lambda on the shared role signal Step Functions back ---
+# Needed by handle_transcribe_completion (the only remaining
+# waitForTaskToken stage) to call SendTaskSuccess/Failure. Previously
+# a leftover from when MediaConvert also needed this permission.
+resource "aws_iam_role_policy" "lambda_step_functions_callback" {
+  name = "${var.project_name}-lambda-step-functions-callback"
   role = aws_iam_role.lambda_execution.id
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
       Effect   = "Allow"
-      Action   = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:DeleteItem"]
-      Resource = aws_dynamodb_table.mediaconvert_tokens.arn
+      Action   = ["states:SendTaskSuccess", "states:SendTaskFailure"]
+      Resource = "*"
     }]
   })
 }
 
 # --- Extra permissions for lambda_execution role: Transcribe ---
-# Transcribe has no separate service role like MediaConvert does - it
+# Transcribe has no separate service role of its own - it
 # just uses the permissions of whichever caller (this Lambda's role)
 # invokes StartTranscriptionJob. So this grants read on raw_video
 # (input) and write on processed (transcript output), plus the
@@ -728,8 +533,8 @@ resource "aws_iam_role_policy" "lambda_transcribe" {
 }
 
 # --- DynamoDB table: maps Transcribe job names to Step Functions task tokens ---
-# Same handoff pattern as mediaconvert_tokens - Transcribe job names are
-# far shorter than a Step Functions task token, so the token can't be
+# Transcribe job names are far shorter than a Step Functions task
+# token, so the token can't be
 # attached to the job directly. Stored here instead, keyed by job name,
 # looked up when the completion Lambda fires.
 resource "aws_dynamodb_table" "transcribe_tokens" {
@@ -784,7 +589,7 @@ resource "aws_lambda_function" "submit_transcribe_job" {
 }
 
 # --- Lambda: handles Transcribe job completion ---
-# Triggered by an EventBridge rule (added in Piece 4) whenever a
+# Triggered by an EventBridge rule whenever a
 # Transcribe job finishes. Pulls the task token back out of DynamoDB
 # using the job name and wakes the paused Step Functions execution.
 resource "aws_lambda_function" "handle_transcribe_completion" {
@@ -878,7 +683,7 @@ resource "aws_iam_role_policy" "lambda_bedrock" {
 # --- Lambda: generates study notes via Bedrock ---
 # Called directly by Step Functions (plain Task, not waitForTaskToken) -
 # Bedrock's Converse API is synchronous, so no wait-and-callback pattern
-# is needed here, unlike MediaConvert/Transcribe. Fetches the transcript
+# is needed here, unlike Transcribe. Fetches the transcript
 # from processed/transcripts/, sends it to Claude, returns the notes text.
 resource "aws_lambda_function" "generate_study_notes" {
   function_name = "${var.project_name}-generate-study-notes"
