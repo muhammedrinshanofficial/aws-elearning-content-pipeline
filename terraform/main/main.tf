@@ -335,6 +335,9 @@ resource "aws_ecs_task_definition" "preprocessing_worker" {
 # --- Step Functions: the pipeline itself ---
 # Preprocess/validate (ECS) -> Transcribe -> generate study notes
 # (Bedrock) -> render PDF. Each stage below is a real AWS integration.
+# Any stage that fails routes to HandlePipelineFailure, which marks
+# the corresponding course_metadata row as FAILED instead of leaving
+# it stuck at PROCESSING forever.
 resource "aws_cloudwatch_log_group" "step_functions" {
   name              = "/aws/vendedlogs/states/${var.project_name}-pipeline"
   retention_in_days = 14
@@ -365,10 +368,15 @@ resource "aws_sfn_state_machine" "pipeline" {
             }
           }
         }
+        Catch = [{
+          ErrorEquals = ["States.ALL"]
+          ResultPath  = "$.error"
+          Next        = "HandlePipelineFailure"
+        }]
         ResultPath = "$.ecsResult"
         Next       = "TranscribeAudio"
       }
-      TranscribeAudio = {
+            TranscribeAudio = {
         Type     = "Task"
         Resource = "arn:aws:states:::lambda:invoke.waitForTaskToken"
         Parameters = {
@@ -377,13 +385,19 @@ resource "aws_sfn_state_machine" "pipeline" {
             "TaskToken.$"     = "$$.Task.Token"
             "input_key.$"     = "$.input_key"
             "language_code.$" = "$.language_code"
+            "video_id.$"      = "$.video_id"
           }
         }
-                TimeoutSeconds = 3600
+        TimeoutSeconds = 3600
+        Catch = [{
+          ErrorEquals = ["States.ALL"]
+          ResultPath  = "$.error"
+          Next        = "HandlePipelineFailure"
+        }]
         ResultPath = "$.transcribeResult"
         Next = "GenerateStudyNotes"
       }
-                  GenerateStudyNotes = {
+      GenerateStudyNotes = {
         Type     = "Task"
         Resource = "arn:aws:states:::lambda:invoke"
         Parameters = {
@@ -393,17 +407,37 @@ resource "aws_sfn_state_machine" "pipeline" {
         ResultSelector = {
           "notes.$" = "$.Payload.notes"
         }
+        Catch = [{
+          ErrorEquals = ["States.ALL"]
+          ResultPath  = "$.error"
+          Next        = "HandlePipelineFailure"
+        }]
         ResultPath = "$.studyNotesResult"
         Next = "RenderPdf"
       }
-            RenderPdf = {
+      RenderPdf = {
         Type     = "Task"
         Resource = "arn:aws:states:::lambda:invoke"
         Parameters = {
           FunctionName = aws_lambda_function.render_pdf.arn
           "Payload.$"  = "$"
         }
+        Catch = [{
+          ErrorEquals = ["States.ALL"]
+          ResultPath  = "$.error"
+          Next        = "HandlePipelineFailure"
+        }]
         ResultPath = "$.renderPdfResult"
+        End        = true
+      }
+      HandlePipelineFailure = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::lambda:invoke"
+        Parameters = {
+          FunctionName = aws_lambda_function.handle_pipeline_failure.arn
+          "Payload.$"  = "$"
+        }
+        ResultPath = "$.failureHandled"
         End        = true
       }
     }
@@ -733,7 +767,8 @@ resource "aws_lambda_function" "render_pdf" {
 
   environment {
     variables = {
-      PROCESSED_BUCKET = aws_s3_bucket.processed.bucket
+      PROCESSED_BUCKET      = aws_s3_bucket.processed.bucket
+      COURSE_METADATA_TABLE = aws_dynamodb_table.course_metadata.name
     }
   }
 }
@@ -751,4 +786,125 @@ resource "aws_iam_role_policy" "step_functions_lambda_pdf" {
       Resource = aws_lambda_function.render_pdf.arn
     }]
   })
+}
+
+# --- IAM: dispatcher's permissions ---
+# Read the uploaded object's metadata, create the initial
+# course_metadata row, and start the pipeline.
+resource "aws_iam_role_policy" "lambda_dispatcher" {
+  name = "${var.project_name}-lambda-dispatcher"
+  role = aws_iam_role.lambda_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "${aws_s3_bucket.raw_video.arn}/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem"]
+        Resource = aws_dynamodb_table.course_metadata.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["states:StartExecution"]
+        Resource = aws_sfn_state_machine.pipeline.arn
+      }
+    ]
+  })
+}
+
+# --- Lambda: dispatches a new upload into the pipeline ---
+# Triggered directly by S3 on upload. Decodes the S3 key, resolves
+# the language, writes the initial course_metadata row, and starts a
+# Step Functions execution for this video.
+resource "aws_lambda_function" "dispatch_pipeline" {
+  function_name = "${var.project_name}-dispatch-pipeline"
+  role          = aws_iam_role.lambda_execution.arn
+  handler       = "index.handler"
+  runtime       = "python3.12"
+  timeout       = 30
+  filename          = "${path.module}/../../lambdas/dispatch_pipeline.zip"
+  source_code_hash  = filebase64sha256("${path.module}/../../lambdas/dispatch_pipeline.zip")
+
+  environment {
+    variables = {
+      COURSE_METADATA_TABLE = aws_dynamodb_table.course_metadata.name
+      STATE_MACHINE_ARN     = aws_sfn_state_machine.pipeline.arn
+      DEFAULT_LANGUAGE_CODE = "en-US"
+    }
+  }
+}
+
+# --- IAM: lets any Lambda on the shared role update course_metadata ---
+# Used by render_pdf now (part 3) and handle_pipeline_failure below
+# (part 4).
+resource "aws_iam_role_policy" "lambda_course_metadata" {
+  name = "${var.project_name}-lambda-course-metadata"
+  role = aws_iam_role.lambda_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["dynamodb:UpdateItem"]
+      Resource = aws_dynamodb_table.course_metadata.arn
+    }]
+  })
+}
+
+# --- Lambda: marks course_metadata as FAILED when any pipeline stage errors ---
+resource "aws_lambda_function" "handle_pipeline_failure" {
+  function_name = "${var.project_name}-handle-pipeline-failure"
+  role          = aws_iam_role.lambda_execution.arn
+  handler       = "index.handler"
+  runtime       = "python3.12"
+  timeout       = 10
+  filename          = "${path.module}/../../lambdas/handle_pipeline_failure.zip"
+  source_code_hash  = filebase64sha256("${path.module}/../../lambdas/handle_pipeline_failure.zip")
+
+  environment {
+    variables = {
+      COURSE_METADATA_TABLE = aws_dynamodb_table.course_metadata.name
+    }
+  }
+}
+
+# --- Let Step Functions invoke the failure-handler Lambda ---
+resource "aws_iam_role_policy" "step_functions_lambda_failure_handler" {
+  name = "${var.project_name}-sfn-lambda-invoke-failure-handler"
+  role = aws_iam_role.step_functions_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "lambda:InvokeFunction"
+      Resource = aws_lambda_function.handle_pipeline_failure.arn
+    }]
+  })
+}
+
+# --- Let S3 invoke the dispatcher Lambda directly ---
+resource "aws_lambda_permission" "s3_invoke_dispatcher" {
+  statement_id  = "AllowS3Invoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.dispatch_pipeline.function_name
+  principal     = "s3.amazonaws.com"
+  source_arn    = aws_s3_bucket.raw_video.arn
+}
+
+# --- S3 event notification: new upload -> dispatcher Lambda directly ---
+resource "aws_s3_bucket_notification" "raw_video_upload" {
+  bucket = aws_s3_bucket.raw_video.id
+
+  lambda_function {
+    lambda_function_arn = aws_lambda_function.dispatch_pipeline.arn
+    events              = ["s3:ObjectCreated:*"]
+  }
+
+  depends_on = [aws_lambda_permission.s3_invoke_dispatcher]
 }

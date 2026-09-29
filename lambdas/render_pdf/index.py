@@ -4,6 +4,8 @@ import re
 from fpdf import FPDF, FPDFException
 
 s3 = boto3.client("s3")
+dynamodb = boto3.resource("dynamodb")
+course_metadata = dynamodb.Table(os.environ["COURSE_METADATA_TABLE"])
 
 PROCESSED_BUCKET = os.environ["PROCESSED_BUCKET"]
 
@@ -67,5 +69,14 @@ def handler(event, context):
 
     pdf_key = f"study-notes/{job_name}.pdf"
     s3.upload_file(output_path, PROCESSED_BUCKET, pdf_key)
+
+    video_id = event.get("video_id")
+    if video_id:
+        course_metadata.update_item(
+            Key={"video_id": video_id},
+            UpdateExpression="SET pdf_key = :pdf_key, #s = :status",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":pdf_key": pdf_key, ":status": "COMPLETE"}
+        )
 
     return {"pdf_key": pdf_key}
